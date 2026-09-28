@@ -1,14 +1,16 @@
 # brevo-script
 
-> Keep Brevo SMTP keys from being deleted after 90 days of inactivity — one dummy email, pure `bash` + `curl`.
+> Keep Brevo SMTP and API keys from expiring after 90 days of inactivity — one dummy email per SMTP key, one `GET /v3/account` per API key, pure `bash` + `curl`.
 
 [![License](https://img.shields.io/github/license/pavlojs/brevo-script)](LICENSE)
 [![lint](https://github.com/pavlojs/brevo-script/actions/workflows/lint.yml/badge.svg)](https://github.com/pavlojs/brevo-script/actions/workflows/lint.yml)
 
-Brevo deletes an SMTP key that has not sent anything for 90 days. If the key is
-wired into a side project that only sends mail occasionally, it quietly stops
-working. [`brevo-keepalive.sh`](brevo-keepalive.sh) sends a single throwaway
-message through the relay, which resets that clock.
+Brevo expires SMTP keys and API keys that have seen no activity for 90 days.
+If a key is wired into a side project that only sends mail occasionally, it
+quietly stops working. [`brevo-keepalive.sh`](brevo-keepalive.sh) resets that
+clock: for an SMTP key it sends a single throwaway message through the relay,
+for an API key it makes one read-only `GET /v3/account` request. Either kind,
+or both, can be handled in one run.
 
 ## Requirements
 
@@ -36,6 +38,21 @@ sending with key ****a1b2 ... ok
 all 1 key(s) used, expiry clock reset
 ```
 
+API keys need no sender or recipient, just the key:
+
+```bash
+BREVO_API_KEY=xkeysib-... ./brevo-keepalive.sh
+```
+
+```
+api url:   https://api.brevo.com/v3/account
+api keys:  1
+
+pinging API with key ****c3d4 ... ok
+
+all 1 key(s) used, expiry clock reset
+```
+
 Check the message before sending anything:
 
 ```bash
@@ -52,14 +69,16 @@ The recipient can also be passed as an argument, which overrides `MAIL_TO`:
 
 Read from the environment, or from a `.env` file next to the script. Environment
 variables win over `.env`. Credentials come from the Brevo dashboard under
-**SMTP & API → SMTP**.
+**SMTP & API**. At least one of `BREVO_SMTP_KEY` or `BREVO_API_KEY` must be set.
 
 | Variable | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `BREVO_SMTP_LOGIN` | yes | — | The SMTP login shown next to your keys, usually your account email. |
-| `BREVO_SMTP_KEY` | yes | — | The SMTP key. Comma-separate to keep several keys alive in one run. |
-| `MAIL_FROM` | yes | — | Sender address. Must be a verified sender or domain in Brevo, otherwise the relay answers `550`. |
-| `MAIL_TO` | yes | — | Where the dummy message lands. Your own inbox is fine. |
+| `BREVO_SMTP_KEY` | one of | — | The SMTP key. Comma-separate to keep several keys alive in one run. |
+| `BREVO_API_KEY` | one of | — | The API key. Comma-separate for several. Needs no other variables. |
+| `BREVO_API_URL` | no | `https://api.brevo.com/v3/account` | Endpoint pinged per API key. Any authenticated request counts as activity; this one is read-only and needs no special permission. |
+| `BREVO_SMTP_LOGIN` | with SMTP | — | The SMTP login shown next to your keys, usually your account email. |
+| `MAIL_FROM` | with SMTP | — | Sender address. Must be a verified sender or domain in Brevo, otherwise the relay answers `550`. |
+| `MAIL_TO` | with SMTP | — | Where the dummy message lands. Your own inbox is fine. |
 | `BREVO_SMTP_HOST` | no | `smtp-relay.brevo.com` | |
 | `BREVO_SMTP_PORT` | no | `587` | `587`/`2525` use STARTTLS, `465` uses implicit TLS. |
 | `MAIL_SUBJECT` | no | `Brevo SMTP keep-alive` | |
@@ -70,8 +89,14 @@ Every key needs its own send, so several keys mean several messages:
 BREVO_SMTP_KEY=xsmtpsib-key-one,xsmtpsib-key-two ./brevo-keepalive.sh
 ```
 
-Exit codes: `0` all keys used, `1` configuration error, `2` at least one send
-failed.
+API keys and SMTP keys can be combined in one run:
+
+```bash
+BREVO_SMTP_KEY=xsmtpsib-... BREVO_API_KEY=xkeysib-one,xkeysib-two ./brevo-keepalive.sh
+```
+
+Exit codes: `0` all keys used, `1` configuration error, `2` at least one key
+failed (a send was rejected or the API answered with an error such as `401`).
 
 ## Scheduling
 
@@ -99,7 +124,7 @@ for. It would go quiet before the keys it protects do.
 
 ## Security
 
-The SMTP key is a sending credential — treat it like a password. Details and the
+SMTP and API keys are credentials — treat them like passwords. Details and the
 disclosure policy are in [SECURITY.md](SECURITY.md).
 
 ## License

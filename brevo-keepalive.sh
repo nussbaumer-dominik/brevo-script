@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# brevo-keepalive.sh — send one tiny message through Brevo's SMTP relay so the
-# SMTP key counts as "in use".
+# brevo-keepalive.sh — keep Brevo SMTP and API keys counted as "in use".
 #
-# Brevo deletes SMTP keys that have not sent anything for 90 days. Running this
-# script on a schedule (monthly is plenty) keeps the key alive.
+# Brevo expires SMTP keys and API keys after 90 days without activity. For an
+# SMTP key the only activity is sending, so one tiny message goes through the
+# relay. For an API key any authenticated request counts, so a read-only
+# GET /v3/account is enough. Run this on a schedule (monthly is plenty).
 #
 # Requires: bash 4+ and curl. Nothing else.
 
@@ -13,6 +14,7 @@ set -euo pipefail
 readonly DEFAULT_HOST="smtp-relay.brevo.com"
 readonly DEFAULT_PORT="587"
 readonly DEFAULT_SUBJECT="Brevo SMTP keep-alive"
+readonly DEFAULT_API_URL="https://api.brevo.com/v3/account"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 dry_run=0
@@ -21,23 +23,28 @@ usage() {
   cat <<'EOF'
 Usage: brevo-keepalive.sh [-n|--dry-run] [recipient@example.com]
 
-Sends a single dummy email through the Brevo SMTP relay to keep the SMTP
-key(s) from being deleted after 90 days of inactivity.
+Keeps Brevo keys from expiring after 90 days of inactivity: sends one dummy
+email per SMTP key and one GET /v3/account per API key. Set BREVO_SMTP_KEY,
+BREVO_API_KEY, or both.
 
 Options:
   -n, --dry-run   Print the message and settings, send nothing.
   -h, --help      Show this help.
 
 Configuration (environment, or a .env file next to the script):
-  BREVO_SMTP_LOGIN   Brevo SMTP login (usually your account email).   required
-  BREVO_SMTP_KEY     SMTP key. Comma-separated for several keys.      required
-  MAIL_FROM          Sender address, must be a verified Brevo sender. required
-  MAIL_TO            Recipient of the dummy message.                  required
+  BREVO_SMTP_KEY     SMTP key. Comma-separated for several keys.
+  BREVO_API_KEY      API key. Comma-separated for several keys.
+  BREVO_API_URL      Default: https://api.brevo.com/v3/account
+
+Required only when BREVO_SMTP_KEY is set:
+  BREVO_SMTP_LOGIN   Brevo SMTP login (usually your account email).
+  MAIL_FROM          Sender address, must be a verified Brevo sender.
+  MAIL_TO            Recipient of the dummy message.
   BREVO_SMTP_HOST    Default: smtp-relay.brevo.com
   BREVO_SMTP_PORT    Default: 587 (587/2525 = STARTTLS, 465 = TLS)
   MAIL_SUBJECT       Default: Brevo SMTP keep-alive
 
-Exit codes: 0 = all keys used, 1 = configuration error, 2 = a send failed.
+Exit codes: 0 = all keys used, 1 = configuration error, 2 = a key failed.
 EOF
 }
 
@@ -61,6 +68,19 @@ load_env_file() {
     fi
     [[ -n ${!key:-} ]] || export "$key=$val"
   done <"$file"
+}
+
+# Split a comma-separated key list into the array named by $1, dropping blanks.
+split_keys() {
+  local -n out="$1"
+  local parts part
+  out=()
+  IFS=',' read -r -a parts <<<"${2:-}"
+  for part in "${parts[@]}"; do
+    part="${part//[[:space:]]/}"
+    [[ -n $part ]] && out+=("$part")
+  done
+  return 0
 }
 
 # Show only the tail of a secret, never the secret itself.
@@ -128,20 +148,20 @@ smtp_port="${BREVO_SMTP_PORT:-$DEFAULT_PORT}"
 subject="${MAIL_SUBJECT:-$DEFAULT_SUBJECT}"
 subject="${subject//[$'\r\n']/ }"
 login="${BREVO_SMTP_LOGIN:-}"
+api_url="${BREVO_API_URL:-$DEFAULT_API_URL}"
 
-[[ -n $login ]] || die "BREVO_SMTP_LOGIN is not set (see --help)"
-[[ -n ${BREVO_SMTP_KEY:-} ]] || die "BREVO_SMTP_KEY is not set (see --help)"
-require_address MAIL_FROM "${MAIL_FROM:-}"
-require_address MAIL_TO "${MAIL_TO:-}"
 command -v curl >/dev/null || die "curl is required but not installed"
 
-IFS=',' read -r -a raw_keys <<<"$BREVO_SMTP_KEY"
-keys=()
-for raw_key in "${raw_keys[@]}"; do
-  raw_key="${raw_key//[[:space:]]/}"
-  [[ -n $raw_key ]] && keys+=("$raw_key")
-done
-((${#keys[@]} > 0)) || die "BREVO_SMTP_KEY contains no usable key"
+split_keys keys "${BREVO_SMTP_KEY:-}"
+split_keys api_keys "${BREVO_API_KEY:-}"
+((${#keys[@]} + ${#api_keys[@]} > 0)) ||
+  die "set BREVO_SMTP_KEY and/or BREVO_API_KEY (see --help)"
+
+if ((${#keys[@]})); then
+  [[ -n $login ]] || die "BREVO_SMTP_LOGIN is not set (see --help)"
+  require_address MAIL_FROM "${MAIL_FROM:-}"
+  require_address MAIL_TO "${MAIL_TO:-}"
+fi
 
 if [[ $smtp_port == "465" ]]; then
   url="smtps://$smtp_host:$smtp_port"
@@ -153,16 +173,24 @@ umask 077
 message="$(mktemp "${TMPDIR:-/tmp}/brevo-keepalive.XXXXXX")"
 trap 'rm -f "$message"' EXIT
 
-printf 'relay:  %s\n' "$url"
-printf 'login:  %s\n' "$login"
-printf 'from:   %s\n' "$MAIL_FROM"
-printf 'to:     %s\n' "$MAIL_TO"
-printf 'keys:   %d\n' "${#keys[@]}"
+if ((${#keys[@]})); then
+  printf 'relay:     %s\n' "$url"
+  printf 'login:     %s\n' "$login"
+  printf 'from:      %s\n' "$MAIL_FROM"
+  printf 'to:        %s\n' "$MAIL_TO"
+  printf 'smtp keys: %d\n' "${#keys[@]}"
+fi
+if ((${#api_keys[@]})); then
+  printf 'api url:   %s\n' "$api_url"
+  printf 'api keys:  %d\n' "${#api_keys[@]}"
+fi
 
 if ((dry_run)); then
-  build_message 1 "${#keys[@]}" "$(mask "${keys[0]}")"
-  printf '\n--- message (dry run, nothing sent) ---\n'
-  cat "$message"
+  if ((${#keys[@]})); then
+    build_message 1 "${#keys[@]}" "$(mask "${keys[0]}")"
+    printf '\n--- message (dry run, nothing sent) ---\n'
+    cat "$message"
+  fi
   exit 0
 fi
 
@@ -199,9 +227,32 @@ EOF
   fi
 done
 
+for key in "${api_keys[@]}"; do
+  printf '\npinging API with key %s ... ' "$(mask "$key")"
+  # Same stdin trick as above: the key goes through a curl config, not argv.
+  # --fail turns a 401/403 into a non-zero exit, so a dead key is reported.
+  if curl --config - <<EOF
+url = "$(escape_conf "$api_url")"
+header = "api-key: $(escape_conf "$key")"
+header = "accept: application/json"
+output = "/dev/null"
+connect-timeout = 15
+max-time = 30
+fail
+silent
+show-error
+EOF
+  then
+    printf 'ok\n'
+  else
+    printf 'FAILED\n'
+    failed=1
+  fi
+done
+
 if ((failed)); then
-  printf '\nat least one key could not send — check the errors above\n' >&2
+  printf '\nat least one key failed — check the errors above\n' >&2
   exit 2
 fi
 
-printf '\nall %d key(s) used, expiry clock reset\n' "${#keys[@]}"
+printf '\nall %d key(s) used, expiry clock reset\n' "$((${#keys[@]} + ${#api_keys[@]}))"
